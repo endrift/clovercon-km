@@ -1,7 +1,7 @@
 /* --------------------------------------------------------------------------
  * @license_begin
  *
- *  Controllers I2C driver
+ *  Nintendo CLV/Wii Classic/Wii Pro controllers I2C driver
  *  Copyright (C) 2016  Nintendo Co. Ltd
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -35,17 +35,21 @@
 #include <linux/mutex.h>
 #include <linux/bug.h>
 
-MODULE_AUTHOR("Christophe Aguettaz <christophe.aguettaz@nerd.nintendo.com>");
-MODULE_DESCRIPTION("Controllers on I2C");
+MODULE_AUTHOR("Nintendo Co., Ltd");
+MODULE_DESCRIPTION("Nintendo CLV-001/CLV-002/Wii Classic/Wii Pro controllers on I2C");
 
 MODULE_LICENSE("GPL");
 
-#define DRV_NAME "clovercon"
+#define DRV_NAME "clvcon"
 
 #define CLASSIC_ID             0
 #define CONTROLLER_I2C_ADDRESS 0x52
 //Rounded up to multiple of 1/HZ
 #define POLL_INTERVAL          5
+
+// Confirm bit flips before reporting digital button values
+// Beware this implies a one polling interval of input lag
+#define FILTER_DIGITAL_BUTTON 0
 
 /* HOME button is to be reported only after these many successful polling
  * positives.
@@ -88,9 +92,9 @@ MODULE_LICENSE("GPL");
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
 
-#define CLOVERCON_DETECT_USE_IRQ 0
+#define CLVCON_DETECT_USE_IRQ 0
 
-#if CLOVERCON_DETECT_USE_IRQ
+#if CLVCON_DETECT_USE_IRQ
 #define INVAL_IRQ            -1
 #define DETECT_DELAY         (HZ / 10)
 #else
@@ -107,21 +111,21 @@ static DEFINE_MUTEX(detect_task_lock);
 #define VERBOSITY        1
 
 #if VERBOSITY > 0
-	#define ERR(m, ...) printk(KERN_ERR  "Clovercon error: " m "\n", ##__VA_ARGS__)
-	#define INF(m, ...) printk(KERN_INFO  "Clovercon info: " m "\n", ##__VA_ARGS__)
+	#define ERR(m, ...) printk(KERN_ERR  "clvcon error: " m "\n", ##__VA_ARGS__)
+	#define INF(m, ...) printk(KERN_INFO  "clvcon info: " m "\n", ##__VA_ARGS__)
 #else
 	#define ERR(m, ...)
 	#define INF(m, ...)
 #endif
 
 #if VERBOSITY > 1
-	#define DBG(m, ...) printk(KERN_DEBUG  "Clovercon: " m "\n", ##__VA_ARGS__)
+	#define DBG(m, ...) printk(KERN_DEBUG  "clvcon: " m "\n", ##__VA_ARGS__)
 	#if VERBOSITY > 2
 		#define FAST_ERR(m, ...) ERR(m, ##__VA_ARGS__)
 		#define FAST_DBG(m, ...) DBG(m, ##__VA_ARGS__)
 	#else
-		#define FAST_ERR(m, ...) trace_printk(KERN_ERR  "Clovercon error: " m "\n", ##__VA_ARGS__)
-		#define FAST_DBG(m, ...) trace_printk(KERN_DEBUG  "Clovercon: " m "\n", ##__VA_ARGS__)
+		#define FAST_ERR(m, ...) trace_printk(KERN_ERR  "clvcon error: " m "\n", ##__VA_ARGS__)
+		#define FAST_DBG(m, ...) trace_printk(KERN_DEBUG  "clvcon: " m "\n", ##__VA_ARGS__)
 	#endif
 #else
 	#define DBG(m, ...)
@@ -131,6 +135,7 @@ static DEFINE_MUTEX(detect_task_lock);
 
 enum ControllerState {
 	CS_OK,
+	CS_FAST_RETRY, // reconnect after typical noise timespan, 2*15ms -> 4 polling periods at 150Hz
 	CS_RETRY_1,
 	CS_RETRY_2,
 	CS_ERR
@@ -140,18 +145,24 @@ static bool get_bit(u8 data, int bitnum) {
 	return (data & (1 << bitnum)) >> bitnum;
 }
 
-static const struct i2c_device_id clovercon_idtable[] = {
+static const struct i2c_device_id clvcon_idtable[] = {
 	{ "classic", CLASSIC_ID },
 	{}
 };
 
-MODULE_DEVICE_TABLE(i2c, clovercon_idtable);
+MODULE_DEVICE_TABLE(i2c, clvcon_idtable);
 
-struct clovercon_info {
+struct clvcon_button_state
+{
+	bool report;
+	int changed;
+};
+
+struct clvcon_info {
 	struct input_polled_dev *dev;
 	struct i2c_client *client;
 	struct i2c_adapter *adapter;
-#if CLOVERCON_DETECT_USE_IRQ
+#if CLVCON_DETECT_USE_IRQ
 	int irq;
 #endif
 	int detection_active;
@@ -160,9 +171,11 @@ struct clovercon_info {
 	enum ControllerState state;
 	u16 retry_counter;
 	int home_counter;
+	struct clvcon_button_state s6[8];
+	struct clvcon_button_state s7[8];
 };
 
-static struct clovercon_info con_info_list[MAX_CON_COUNT];
+static struct clvcon_info con_info_list[MAX_CON_COUNT];
 static int module_params[2 * MAX_CON_COUNT];
 static int arr_argc = 0;
 
@@ -172,10 +185,10 @@ const char *controller_names[] = {CON_NAME_PREFIX"1", CON_NAME_PREFIX"2",
 
 module_param_array(module_params, int, &arr_argc, 0000);
 MODULE_PARM_DESC(module_params, "Input info in the form con0_i2c_bus, con0_detect_gpio, "
-	                            "form con1_i2c_bus, con1_detect_gpio, ... gpio < 0 means no detection");
+	                            "con1_i2c_bus, con1_detect_gpio, ... gpio < 0 means no detection");
 
-#if CLOVERCON_DETECT_USE_IRQ
-struct clovercon_info * clovercon_info_from_irq(int irq) {
+#if CLVCON_DETECT_USE_IRQ
+struct clvcon_info * clvcon_info_from_irq(int irq) {
 	int i;
 	for (i = 0; i < MAX_CON_COUNT; i++) {
 		if (con_info_list[i].irq == irq) {
@@ -186,7 +199,7 @@ struct clovercon_info * clovercon_info_from_irq(int irq) {
 }
 #endif
 
-struct clovercon_info * clovercon_info_from_adapter(struct i2c_adapter *adapter) {
+struct clvcon_info * clvcon_info_from_adapter(struct i2c_adapter *adapter) {
 	int i;
 	for (i = 0; i < MAX_CON_COUNT; i++) {
 		if (con_info_list[i].adapter == adapter) {
@@ -196,7 +209,7 @@ struct clovercon_info * clovercon_info_from_adapter(struct i2c_adapter *adapter)
 	return NULL;
 }
 
-static int clovercon_write(struct i2c_client *client, u8 *data, size_t count) {
+static int clvcon_write(struct i2c_client *client, u8 *data, size_t count) {
 	struct i2c_msg msg = {
 		.addr = client->addr,
 		.len = count,
@@ -218,10 +231,10 @@ static int clovercon_write(struct i2c_client *client, u8 *data, size_t count) {
 	return 0;
 }
 
-static int clovercon_prepare_read(struct i2c_client *client, u8 address) {
+static int clvcon_prepare_read(struct i2c_client *client, u8 address) {
 	int ret;
 
-	ret = clovercon_write(client, &address, 1);
+	ret = clvcon_write(client, &address, 1);
 	if (ret) {
 		DBG("prepare_read failed");
 		return ret;
@@ -230,7 +243,7 @@ static int clovercon_prepare_read(struct i2c_client *client, u8 address) {
 	return 0;
 }
 
-static int clovercon_read(struct i2c_client *client, u8 address, u8 *values, size_t count) {
+static int clvcon_read(struct i2c_client *client, u8 address, u8 *values, size_t count) {
 	struct i2c_msg data_msg = {
 		.addr = client->addr,
 		.flags = I2C_M_RD,
@@ -239,7 +252,7 @@ static int clovercon_read(struct i2c_client *client, u8 address, u8 *values, siz
 	};
 	int ret;
 
-	ret = clovercon_prepare_read(client, address);
+	ret = clvcon_prepare_read(client, address);
 	if (ret)
 		return ret;
 
@@ -258,11 +271,11 @@ static int clovercon_read(struct i2c_client *client, u8 address, u8 *values, siz
 	return 0;
 }
 
-static int clovercon_read_controller_info(struct i2c_client *client, u8 *data, size_t len) {
+static int clvcon_read_controller_info(struct i2c_client *client, u8 *data, size_t len) {
 	int ret;
 
 	len = MIN(len, 0xff -0xfa + 1);
-	ret = clovercon_read(client, 0xfa, data, len);
+	ret = clvcon_read(client, 0xfa, data, len);
 	if (ret)
 		return ret;
 
@@ -270,25 +283,25 @@ static int clovercon_read_controller_info(struct i2c_client *client, u8 *data, s
 	// print_hex_dump(KERN_DEBUG, "Controller info data: " , DUMP_PREFIX_NONE, 16, 256, data, len, false);
 }
 
-static int clovercon_setup(struct i2c_client *client) {
+static int clvcon_setup(struct i2c_client *client) {
 	u8 init_data[] = { 0xf0, 0x55, 0xfb, 0x00, 0xfe, DATA_FORMAT };
 	static const int CON_INFO_LEN = 6;
 	u8 con_info_data[CON_INFO_LEN];
 	int ret;
 
-	DBG("Clovercon setup");
+	DBG("clvcon setup");
 
-	ret = clovercon_write(client, &init_data[0], 2);
+	ret = clvcon_write(client, &init_data[0], 2);
 	if (ret)
 		goto err;
-	ret = clovercon_write(client, &init_data[2], 2);
+	ret = clvcon_write(client, &init_data[2], 2);
 	if (ret)
 		goto err;
-	ret = clovercon_write(client, &init_data[4], 2);
+	ret = clvcon_write(client, &init_data[4], 2);
 	if (ret)
 		goto err;
 
-	ret = clovercon_read_controller_info(client, con_info_data, CON_INFO_LEN);
+	ret = clvcon_read_controller_info(client, con_info_data, CON_INFO_LEN);
 	if (ret < 0) {
 		ERR("error reading controller info");
 		goto err;
@@ -351,46 +364,104 @@ clamp_end:
 	*py = y * y_sign;
 }
 
-static void clovercon_poll(struct input_polled_dev *polled_dev) {
-	struct clovercon_info *info = polled_dev->private;
+/* When DC noise is kicking in, we want to avoid the driver to report wrong
+ * btn state changes.
+ *
+ * This is specially important for example to avoid switching to the menui
+ * spuriously because of noisy home button events.
+ *
+ * The following function will filter out as many state changes as the module
+ * is configured to before actually reporting the change
+ *
+ * NB: even the Mini NES controller can report the home button event even
+ * though no physical button is present. The MCU is the same as the
+ * classic/pro controller.
+ */
+
+static inline void clvcon_df3_btn(struct clvcon_button_state* btn, const u8 payload, const int id)
+{
+	bool v;
+
+	v = !get_bit(payload, id);
+	btn += id;
+
+#if FILTER_DIGITAL_BUTTON
+	if (btn->report != v) {
+		btn->changed++;
+		if (btn->changed > 1) {
+			btn->report = !btn->report;
+			btn->changed = 0;
+		}
+	} else {
+		btn->changed = 0;
+	}
+#else
+        btn->report = v;
+#endif
+}
+
+/* The Wii could trust the payload 100% because the Wii Remote
+ * controller is powered with AA batteries. In the case of
+ * CLV, high voltage on DC power supply has shown very noisy
+ * payloads coming out of the I²C bus. But we don't have any
+ * checksum or parity bits to discard such corrupted payloads.
+ *
+ * However the payload zero padding should be impacted by the
+ * DC noise and some high bits should pop up there too.
+ *
+ * This function reports a noisy zero padding area
+ */
+static int inline clvcon_df3_zero_padding_is_noisy(const u8* payload)
+{
+	int i;
+	int up = 0;
+	for (i=8; i<21; i++) {
+		up += payload[i];
+	}
+	return up;
+}
+
+static inline void clvcon_info_reset_button_states(struct clvcon_info* info) {
+	info->home_counter = 0;
+	memset(info->s6, 0, sizeof(info->s6));
+	memset(info->s7, 0, sizeof(info->s7));
+}
+
+static void clvcon_poll(struct input_polled_dev *polled_dev) {
+	struct clvcon_info *info = polled_dev->private;
 	static const int READ_LEN = 21;
 	u8 data[READ_LEN];
 	int jx, jy, rx, ry, tl, tr;
-	bool left, right, up, down, a, b, x, y, select, start, home, l, r, zl, zr;
 	u16 retry_delay = RETRY_BASE_DELAY;
 	int ret;
 
 	switch (info->state) {
 	case CS_OK:
-		ret = clovercon_read(info->client, 0, data, READ_LEN);
+		ret = clvcon_read(info->client, 0, data, READ_LEN);
 		if (ret) {
 			DBG("read failed for active controller - possible controller disconnect");
 			INF("moving controller %i to error state", info->id);
+			/* When DC noise kicks in, reading from I²C becomes unreliable
+			 * typical noise bursts have a 15ms duration every 300ms and
+			 * reconnecting after ~30ms would be enough. However hardware
+			 * team reported the error level in their test environment
+			 * would be too high.
+			 *
+			 * So it's impossible to just use CS_FAST_RETRY as the plan was
+			 * Stick to the very conservative value of CS_RETRY_1, leading
+			 * to a 850ms reconnection delay. */
 			info->state = CS_RETRY_1;
 			break;
 		}
 
 		//print_hex_dump(KERN_DEBUG, "", DUMP_PREFIX_OFFSET, 16, 256, data, READ_LEN, false);
 
-		/* The Wii could trust the payload 100% because the Wii Remote
-		 * controller is powered with AA batteries. In the case of
-		 * CLOVER high voltage on DC power supply has shown very noisy
-		 * payloads coming out of the I²C bus. But we don't have any
-		 * checksum or parity bits to discard such corrupted payloads.
-		 *
-		 * However the payload zero padding should be impacted by the
-		 * DC noise and some high bits should pop up there too.
-		 *
-		 * Use that as last resort discarding criteria */
-		jy = 0;
-		for (jx=8; jx<21; jx++) {
-			jy += data[jx];
-		}
-		if (jy) {
-			/* noise, discard payload */
+		/* Use noise presence in the zero padding as discard criteri
+		 * for the data packet */
+		if (clvcon_df3_zero_padding_is_noisy(data))
 			break;
-		}
 
+		// Report analog sticks / buttons
 		jx = data[0] - 0x80;
 		rx = data[1] - 0x80;
 		jy = 0x7fl - data[2];
@@ -408,31 +479,16 @@ static void clovercon_poll(struct input_polled_dev *polled_dev) {
 		input_report_abs(polled_dev->input, ABS_Z, tl);
 		input_report_abs(polled_dev->input, ABS_RZ, tr);
 
-		r      = !get_bit(data[6], DF3_BTN_R);
-		start  = !get_bit(data[6], DF3_BTN_START);
-		home   = !get_bit(data[6], DF3_BTN_HOME);
-		select = !get_bit(data[6], DF3_BTN_SELECT);
-		l      = !get_bit(data[6], DF3_BTN_L);
-		down   = !get_bit(data[6], DF3_BTN_DOWN);
-		right  = !get_bit(data[6], DF3_BTN_RIGHT);
+		// Report digital buttons from byte6
+		clvcon_df3_btn(info->s6, data[6], DF3_BTN_R);
+		clvcon_df3_btn(info->s6, data[6], DF3_BTN_START);
+		clvcon_df3_btn(info->s6, data[6], DF3_BTN_HOME);
+		clvcon_df3_btn(info->s6, data[6], DF3_BTN_SELECT);
+		clvcon_df3_btn(info->s6, data[6], DF3_BTN_L);
+		clvcon_df3_btn(info->s6, data[6], DF3_BTN_DOWN);
+		clvcon_df3_btn(info->s6, data[6], DF3_BTN_RIGHT);
 
-		up   = !get_bit(data[7], DF3_BTN_UP);
-		left = !get_bit(data[7], DF3_BTN_LEFT);
-		zr   = !get_bit(data[7], DF3_BTN_ZR);
-		x    = !get_bit(data[7], DF3_BTN_X);
-		a    = !get_bit(data[7], DF3_BTN_A);
-		y    = !get_bit(data[7], DF3_BTN_Y);
-		b    = !get_bit(data[7], DF3_BTN_B);
-		zl   = !get_bit(data[7], DF3_BTN_ZL);
-
-		/* When DC noise is kicking in, we want to avoid the emulator
-		 * switching to the menu supriously because of noisy home button
-		 * events.
-		 *
-		 * Note that even the Mini NES controller can report the event
-		 * even though no physical button is present. The MCU is the
-		 * same as the classic/pro controller. */
-		if (home) {
+		if (info->s6[DF3_BTN_HOME].report) {
 			info->home_counter++;
 			if (info->home_counter>HOME_BUTTON_THRESHOLD) {
 				info->home_counter = HOME_BUTTON_THRESHOLD;
@@ -441,25 +497,39 @@ static void clovercon_poll(struct input_polled_dev *polled_dev) {
 			info->home_counter = 0;
 		}
 
-		input_report_key(polled_dev->input, BTN_TR,     r);
-		input_report_key(polled_dev->input, BTN_START,  start);
-		input_report_key(polled_dev->input, BTN_MODE,   (info->home_counter>=HOME_BUTTON_THRESHOLD));
-		input_report_key(polled_dev->input, BTN_SELECT, select);
-		input_report_key(polled_dev->input, BTN_TL,     l);
-		input_report_key(polled_dev->input, BTN_TRIGGER_HAPPY4,  down);
-		input_report_key(polled_dev->input, BTN_TRIGGER_HAPPY2,  right);
-		input_report_key(polled_dev->input, BTN_TRIGGER_HAPPY3,  up);
-		input_report_key(polled_dev->input, BTN_TRIGGER_HAPPY1,  left);
-		input_report_key(polled_dev->input, BTN_TR2,    zr);
-		input_report_key(polled_dev->input, BTN_X,      x);
-		input_report_key(polled_dev->input, BTN_A,      a);
-		input_report_key(polled_dev->input, BTN_Y,      y);
-		input_report_key(polled_dev->input, BTN_B,      b);
-		input_report_key(polled_dev->input, BTN_TL2,    zl);
+		input_report_key(polled_dev->input, BTN_TR, info->s6[DF3_BTN_R].report);
+		input_report_key(polled_dev->input, BTN_START, info->s6[DF3_BTN_START].report);
+		input_report_key(polled_dev->input, BTN_MODE, (info->home_counter>=HOME_BUTTON_THRESHOLD));
+		input_report_key(polled_dev->input, BTN_SELECT, info->s6[DF3_BTN_SELECT].report);
+		input_report_key(polled_dev->input, BTN_TL, info->s6[DF3_BTN_L].report);
+		input_report_key(polled_dev->input, BTN_TRIGGER_HAPPY4, info->s6[DF3_BTN_DOWN].report);
+		input_report_key(polled_dev->input, BTN_TRIGGER_HAPPY2, info->s6[DF3_BTN_RIGHT].report);
+
+		// Report digital buttons from byte7
+		clvcon_df3_btn(info->s7, data[7], DF3_BTN_UP);
+		clvcon_df3_btn(info->s7, data[7], DF3_BTN_LEFT);
+		clvcon_df3_btn(info->s7, data[7], DF3_BTN_ZR);
+		clvcon_df3_btn(info->s7, data[7], DF3_BTN_X);
+		clvcon_df3_btn(info->s7, data[7], DF3_BTN_A);
+		clvcon_df3_btn(info->s7, data[7], DF3_BTN_Y);
+		clvcon_df3_btn(info->s7, data[7], DF3_BTN_B);
+		clvcon_df3_btn(info->s7, data[7], DF3_BTN_ZL);
+
+		input_report_key(polled_dev->input, BTN_TRIGGER_HAPPY3, info->s7[DF3_BTN_UP].report);
+		input_report_key(polled_dev->input, BTN_TRIGGER_HAPPY1, info->s7[DF3_BTN_LEFT].report);
+		input_report_key(polled_dev->input, BTN_TR2, info->s7[DF3_BTN_ZR].report);
+		input_report_key(polled_dev->input, BTN_X, info->s7[DF3_BTN_X].report);
+		input_report_key(polled_dev->input, BTN_A, info->s7[DF3_BTN_A].report);
+		input_report_key(polled_dev->input, BTN_Y, info->s7[DF3_BTN_Y].report);
+		input_report_key(polled_dev->input, BTN_B, info->s7[DF3_BTN_B].report);
+		input_report_key(polled_dev->input, BTN_TL2, info->s7[DF3_BTN_ZL].report);
 
 		input_sync(polled_dev->input);
 
 		break;
+	case CS_FAST_RETRY:
+		retry_delay /= 32;
+		//fall-through
 	case CS_RETRY_1:
 		retry_delay /= 2;
 		//fall-through
@@ -470,11 +540,12 @@ static void clovercon_poll(struct input_polled_dev *polled_dev) {
 		info->retry_counter++;
 		if (info->retry_counter == retry_delay) {
 			DBG("retrying controller setup");
-			ret = clovercon_setup(info->client);
+			ret = clvcon_setup(info->client);
 			if (ret) {
 				info->state = MIN(CS_ERR, info->state + 1);
 			} else {
 				info->state = CS_OK;
+				clvcon_info_reset_button_states(info);
 				INF("setup succeeded for controller %i, moving to OK state", info->id);
 			}
 			info->retry_counter = 0;
@@ -485,21 +556,21 @@ static void clovercon_poll(struct input_polled_dev *polled_dev) {
 	}
 }
 
-static void clovercon_open(struct input_polled_dev *polled_dev) {
-	struct clovercon_info *info = polled_dev->private;
-	if (clovercon_setup(info->client)) {
+static void clvcon_open(struct input_polled_dev *polled_dev) {
+	struct clvcon_info *info = polled_dev->private;
+	if (clvcon_setup(info->client)) {
 		info->retry_counter = 0;
 		info->state = CS_RETRY_1;
 		INF("opened controller %i, controller in error state after failed setup", info->id);
 	} else {
 		info->state = CS_OK;
-		info->home_counter = 0;
+		clvcon_info_reset_button_states(info);
 		INF("opened controller %i, controller in OK state", info->id);
 	}
 }
 
-static int clovercon_probe(struct i2c_client *client, const struct i2c_device_id *id) {
-	struct clovercon_info *info;
+static int clvcon_probe(struct i2c_client *client, const struct i2c_device_id *id) {
+	struct clvcon_info *info;
 	struct input_polled_dev *polled_dev;
 	struct input_dev *input_dev;
 	int ret = 0;
@@ -514,7 +585,7 @@ static int clovercon_probe(struct i2c_client *client, const struct i2c_device_id
 	}
 
 	mutex_lock(&con_state_lock);
-	info = clovercon_info_from_adapter(client->adapter);
+	info = clvcon_info_from_adapter(client->adapter);
 	if (!info) {
 		ERR("unkonwn client passed to probe");
 		mutex_unlock(&con_state_lock);
@@ -533,8 +604,8 @@ static int clovercon_probe(struct i2c_client *client, const struct i2c_device_id
 	info->dev = polled_dev;
 
 	polled_dev->poll_interval = POLL_INTERVAL;
-	polled_dev->poll = clovercon_poll;
-	polled_dev->open = clovercon_open;
+	polled_dev->poll = clvcon_poll;
+	polled_dev->open = clvcon_open;
 	polled_dev->private = info;
 
 	input_dev = polled_dev->input;
@@ -542,7 +613,7 @@ static int clovercon_probe(struct i2c_client *client, const struct i2c_device_id
 	//change controller_names initializer when changing MAX_CON_COUNT
 	BUILD_BUG_ON(MAX_CON_COUNT != ARRAY_SIZE(controller_names)); 
 	input_dev->name = controller_names[info->id - 1];
-	input_dev->phys = DRV_NAME"/clovercon";
+	input_dev->phys = DRV_NAME"/clvcon";
 	input_dev->id.bustype = BUS_I2C;
 	input_dev->dev.parent = &client->dev;
 
@@ -598,8 +669,8 @@ err_register_polled_dev:
 	return ret;
 }
 
-static int clovercon_remove(struct i2c_client *client) {
-	struct clovercon_info *info;
+static int clvcon_remove(struct i2c_client *client) {
+	struct clvcon_info *info;
 	struct input_polled_dev *polled_dev;
 	
 	mutex_lock(&con_state_lock);
@@ -616,27 +687,27 @@ static int clovercon_remove(struct i2c_client *client) {
 	return 0;
 }
 
-static struct i2c_driver clovercon_driver = {
+static struct i2c_driver clvcon_driver = {
 	.driver = {
-		.name	= "clovercon",
+		.name	= "clvcon",
 		.owner = THIS_MODULE,
 	},
 
-	.id_table	= clovercon_idtable,
-	.probe		= clovercon_probe,
-	.remove		= clovercon_remove,
+	.id_table	= clvcon_idtable,
+	.probe		= clvcon_probe,
+	.remove		= clvcon_remove,
 };
 
-static struct i2c_board_info clovercon_i2c_board_info = {
+static struct i2c_board_info clvcon_i2c_board_info = {
 	I2C_BOARD_INFO("classic", CONTROLLER_I2C_ADDRESS),
 };
 
 /* Must be holding con_state_lock */
-int clovercon_add_controller(struct clovercon_info *info) {
+int clvcon_add_controller(struct clvcon_info *info) {
 	struct i2c_client *client;
 
 	mutex_unlock(&con_state_lock);
-	client = i2c_new_device(info->adapter, &clovercon_i2c_board_info);
+	client = i2c_new_device(info->adapter, &clvcon_i2c_board_info);
 	mutex_lock(&con_state_lock);
 	if (!client) {
 		ERR("could not create i2c device");
@@ -648,7 +719,7 @@ int clovercon_add_controller(struct clovercon_info *info) {
 }
 
 /* Must be holding con_state_lock */
-void clovercon_remove_controller(struct clovercon_info *info) {
+void clvcon_remove_controller(struct clvcon_info *info) {
 	struct i2c_client *client = info->client;
 
 	mutex_unlock(&con_state_lock);
@@ -659,7 +730,7 @@ void clovercon_remove_controller(struct clovercon_info *info) {
 	INF("removed device for controller %i", info->id);
 }
 
-static void clovercon_remove_controllers(void) {
+static void clvcon_remove_controllers(void) {
 	int i;
 
 	mutex_lock(&con_state_lock);
@@ -667,13 +738,13 @@ static void clovercon_remove_controllers(void) {
 		if (!con_info_list[i].client) {
 			continue;
 		}
-		clovercon_remove_controller(&con_info_list[i]);
+		clvcon_remove_controller(&con_info_list[i]);
 	}
 	mutex_unlock(&con_state_lock);
 }
 
-static void clovercon_detect_task(struct work_struct *dummy) {
-	struct clovercon_info *info;
+static void clvcon_detect_task(struct work_struct *dummy) {
+	struct clvcon_info *info;
 	int i;
 	int val;
 
@@ -689,10 +760,10 @@ static void clovercon_detect_task(struct work_struct *dummy) {
 		DBG("detect pin value: %i", val);
 		if (val && !info->client) {
 			DBG("detect task adding controller %i", i);
-			clovercon_add_controller(info);
+			clvcon_add_controller(info);
 		} else if (!val && info->client) {
 			DBG("detect task removing controller %i", i);
-			clovercon_remove_controller(info);
+			clvcon_remove_controller(info);
 		}
 	}
 	mutex_unlock(&con_state_lock);
@@ -700,10 +771,10 @@ static void clovercon_detect_task(struct work_struct *dummy) {
 	DBG("detect task done");
 }
 
-#if CLOVERCON_DETECT_USE_IRQ
+#if CLVCON_DETECT_USE_IRQ
 
-static irqreturn_t clovercon_detect_interrupt(int irq, void* dummy) {
-	struct clovercon_info *info = clovercon_info_from_irq(irq);
+static irqreturn_t clvcon_detect_interrupt(int irq, void* dummy) {
+	struct clvcon_info *info = clvcon_info_from_irq(irq);
 	static int initialized = 0;
 
 	if (info == NULL) {
@@ -712,10 +783,10 @@ static irqreturn_t clovercon_detect_interrupt(int irq, void* dummy) {
 	}
 
 	if (initialized == 0) {
-		INIT_DELAYED_WORK(&detect_work, clovercon_detect_task);
+		INIT_DELAYED_WORK(&detect_work, clvcon_detect_task);
 		initialized = 1;
 	} else {
-		PREPARE_DELAYED_WORK(&detect_work, clovercon_detect_task);
+		PREPARE_DELAYED_WORK(&detect_work, clvcon_detect_task);
 	}
 
 	schedule_delayed_work(&detect_work, DETECT_DELAY);
@@ -724,7 +795,7 @@ static irqreturn_t clovercon_detect_interrupt(int irq, void* dummy) {
 	return IRQ_HANDLED;
 }
 
-static int clovercon_setup_irq_detect(struct clovercon_info *info) {
+static int clvcon_setup_irq_detect(struct clvcon_info *info) {
 	int irq;
 	int ret;
 
@@ -742,7 +813,7 @@ static int clovercon_setup_irq_detect(struct clovercon_info *info) {
 	info->detection_active = 1;
 	mutex_unlock(&con_state_lock);
 
-	ret = request_irq(ret, clovercon_detect_interrupt, IRQ_TYPE_EDGE_BOTH, "clovercon", NULL);
+	ret = request_irq(ret, clvcon_detect_interrupt, IRQ_TYPE_EDGE_BOTH, "clvcon", NULL);
 	if (ret) {
 		ERR("failed to request irq");
 		return ret;
@@ -751,7 +822,7 @@ static int clovercon_setup_irq_detect(struct clovercon_info *info) {
 	return 0;
 }
 
-static void clovercon_teardown_irq_detect(struct clovercon_info *info) {
+static void clvcon_teardown_irq_detect(struct clvcon_info *info) {
 	free_irq(info->irq, NULL);
 	mutex_lock(&con_state_lock);
 	info->detection_active = 0;
@@ -759,23 +830,23 @@ static void clovercon_teardown_irq_detect(struct clovercon_info *info) {
 	mutex_unlock(&con_state_lock);
 }
 
-#else //CLOVERCON_DETECT_USE_IRQ
+#else //CLVCON_DETECT_USE_IRQ
 
-static void clovercon_detect_timer_task(struct work_struct *dummy) {
+static void clvcon_detect_timer_task(struct work_struct *dummy) {
 	static int initialized = 0;
 
 	if (initialized == 0) {
-		INIT_DELAYED_WORK(&detect_work, clovercon_detect_timer_task);
+		INIT_DELAYED_WORK(&detect_work, clvcon_detect_timer_task);
 		initialized = 1;
 	} else {
-		PREPARE_DELAYED_WORK(&detect_work, clovercon_detect_timer_task);
+		PREPARE_DELAYED_WORK(&detect_work, clvcon_detect_timer_task);
 	}
 
-	clovercon_detect_task(NULL);
+	clvcon_detect_task(NULL);
 	schedule_delayed_work(&detect_work, DETECT_DELAY);
 }
 
-static int clovercon_setup_timer_detect(struct clovercon_info *info) {
+static int clvcon_setup_timer_detect(struct clvcon_info *info) {
 	static int task_running = 0;
 
 	mutex_lock(&con_state_lock);
@@ -786,20 +857,20 @@ static int clovercon_setup_timer_detect(struct clovercon_info *info) {
 		return 0;
 
 	task_running = 1;
-	clovercon_detect_timer_task(NULL);
+	clvcon_detect_timer_task(NULL);
 
 	return 0;
 }
 
-static void clovercon_teardown_timer_detect(struct clovercon_info *info) {
+static void clvcon_teardown_timer_detect(struct clvcon_info *info) {
 	mutex_lock(&con_state_lock);
 	info->detection_active = 0;
 	mutex_unlock(&con_state_lock);
 }
 
-#endif //CLOVERCON_DETECT_USE_IRQ
+#endif //CLVCON_DETECT_USE_IRQ
 
-static int clovercon_setup_i2c(struct clovercon_info *info, int i2c_bus) {
+static int clvcon_setup_i2c(struct clvcon_info *info, int i2c_bus) {
 	struct i2c_adapter *adapter;
 
 	adapter = i2c_get_adapter(i2c_bus);
@@ -813,10 +884,10 @@ static int clovercon_setup_i2c(struct clovercon_info *info, int i2c_bus) {
 	return 0;
 }
 
-static int clovercon_setup_detection(struct clovercon_info *info, int gpio_pin) {
+static int clvcon_setup_detection(struct clvcon_info *info, int gpio_pin) {
 	int ret;
 
-	ret = gpio_request(gpio_pin, "clovercon_detect");
+	ret = gpio_request(gpio_pin, "clvcon_detect");
 	if (ret) {
 		ERR("gpio request failed for pin %i", gpio_pin);
 		return ret;
@@ -836,11 +907,11 @@ static int clovercon_setup_detection(struct clovercon_info *info, int gpio_pin) 
 		goto err_gpio_cleanup;
 	}
 
-#if CLOVERCON_DETECT_USE_IRQ
+#if CLVCON_DETECT_USE_IRQ
 	info->irq = INVAL_IRQ;
-	ret = clovercon_setup_irq_detect(info);
+	ret = clvcon_setup_irq_detect(info);
 #else
-	ret = clovercon_setup_timer_detect(info);
+	ret = clvcon_setup_timer_detect(info);
 #endif
 
 	if (ret) {
@@ -851,10 +922,10 @@ static int clovercon_setup_detection(struct clovercon_info *info, int gpio_pin) 
 	return 0;
 
 err_detect_cleanup:
-#if CLOVERCON_DETECT_USE_IRQ
-	clovercon_teardown_irq_detect(info);
+#if CLVCON_DETECT_USE_IRQ
+	clvcon_teardown_irq_detect(info);
 #else
-	clovercon_teardown_timer_detect(info);
+	clvcon_teardown_timer_detect(info);
 #endif
 
 err_gpio_cleanup:
@@ -862,7 +933,7 @@ err_gpio_cleanup:
 	return ret;
 }
 
-static void clovercon_teardown_detection(void) {
+static void clvcon_teardown_detection(void) {
 	int i;
 	int gpio;
 
@@ -872,10 +943,10 @@ static void clovercon_teardown_detection(void) {
 		if (!con_info_list[i].detection_active) {
 			continue;
 		}
-#if CLOVERCON_DETECT_USE_IRQ
-		clovercon_teardown_irq_detect(&con_info_list[i]);
+#if CLVCON_DETECT_USE_IRQ
+		clvcon_teardown_irq_detect(&con_info_list[i]);
 #else
-		clovercon_teardown_timer_detect(&con_info_list[i]);
+		clvcon_teardown_timer_detect(&con_info_list[i]);
 #endif
 		mutex_lock(&con_state_lock);
 		con_info_list[i].adapter = NULL;
@@ -887,7 +958,7 @@ static void clovercon_teardown_detection(void) {
 	}
 }
 
-static int __init clovercon_init(void) {
+static int __init clvcon_init(void) {
 	int i2c_bus;
 	int gpio_pin;
 	int ret;
@@ -904,7 +975,7 @@ static int __init clovercon_init(void) {
 
 		DBG("initializing controller %i on bus %i, gpio %i", i, i2c_bus, gpio_pin);
 
-		ret = clovercon_setup_i2c(&con_info_list[i], i2c_bus);
+		ret = clvcon_setup_i2c(&con_info_list[i], i2c_bus);
 		if (ret) {
 			ERR("failed to init controller %i", i);
 			goto err_controller_cleanup;
@@ -912,10 +983,10 @@ static int __init clovercon_init(void) {
 
 		if (gpio_pin < 0) {
 			mutex_lock(&con_state_lock);
-			ret = clovercon_add_controller(&con_info_list[i]);
+			ret = clvcon_add_controller(&con_info_list[i]);
 			mutex_unlock(&con_state_lock);
 		} else {
-			ret = clovercon_setup_detection(&con_info_list[i], gpio_pin);
+			ret = clvcon_setup_detection(&con_info_list[i], gpio_pin);
 			if (ret) {
 				ERR("failed to init controller %i", i);
 				goto err_controller_cleanup;
@@ -923,7 +994,7 @@ static int __init clovercon_init(void) {
 		}
 	}
 
-	ret = i2c_add_driver(&clovercon_driver);
+	ret = i2c_add_driver(&clvcon_driver);
 	if (ret) {
 		ERR("failed to add driver");
 		goto err_controller_cleanup;
@@ -932,19 +1003,19 @@ static int __init clovercon_init(void) {
 	return 0;
 
 err_controller_cleanup:
-	clovercon_teardown_detection();
-	clovercon_remove_controllers();
+	clvcon_teardown_detection();
+	clvcon_remove_controllers();
 	return ret;
 }
 
-module_init(clovercon_init);
+module_init(clvcon_init);
 
-static void __exit clovercon_exit(void) {
+static void __exit clvcon_exit(void) {
 	DBG("exit");
 
-	clovercon_teardown_detection();
-	clovercon_remove_controllers();
-	i2c_del_driver(&clovercon_driver);
+	clvcon_teardown_detection();
+	clvcon_remove_controllers();
+	i2c_del_driver(&clvcon_driver);
 }
 
-module_exit(clovercon_exit);
+module_exit(clvcon_exit);

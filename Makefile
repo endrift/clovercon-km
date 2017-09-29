@@ -1,6 +1,6 @@
 CURRENT = $(shell uname -r)
-TARGET  = clovercon
-OBJS    = clovercon.o
+TARGET  = clvcon
+OBJS    = clvcon.o
 MDIR    = drivers/input/joystick
 KDIR    = /lib/modules/$(CURRENT)/build
 PWD = $(shell pwd)
